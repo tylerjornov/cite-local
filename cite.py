@@ -3,8 +3,8 @@
 
     python3 cite.py
 
-Opens a browser UI. Pick folders, ask questions, get answers with citations.
-Requires Ollama running with nomic-embed-text + granite4.2:3b (or override).
+Opens a browser UI. Pick folders or paste a Mac path, then ask questions.
+Uses nomic-embed-text + granite4.2:3b (override with CITE_EMBED / CITE_GEN).
 """
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
-from urllib.error import URLError
 
 PORT = int(os.environ.get("CITE_PORT", "8787"))
 OLLAMA = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
@@ -27,9 +26,10 @@ GEN_MODEL = os.environ.get("CITE_GEN", "granite4.2:3b")
 CHUNK_CHARS = 900
 CHUNK_OVERLAP = 120
 TOP_K = 6
-MAX_FILES = 400
+MAX_FILES = 2500
 MAX_FILE_BYTES = 1_500_000
-MAX_CHUNKS = 2500
+MAX_CHUNKS = 4000
+MAX_BODY = 8_000_000  # per request; the UI sends small batches
 
 TEXT_EXT = {
     ".txt", ".md", ".mdx", ".rst", ".org", ".tex", ".html", ".htm",
@@ -38,9 +38,13 @@ TEXT_EXT = {
     ".cpp", ".cs", ".java", ".go", ".rs", ".rb", ".php", ".swift",
     ".kt", ".sql", ".sh", ".r", ".bib", ".adoc",
 }
+SKIP_DIRS = {
+    ".git", "node_modules", ".venv", "venv", "__pycache__",
+    ".obsidian", ".trash", "Library", ".cache",
+}
 
 INDEX_LOCK = threading.Lock()
-INDEX: list[dict] = []  # {path, start, text, vec}
+INDEX: list[dict] = []
 
 
 def ollama_post(path: str, body: dict, timeout: int = 180) -> dict:
@@ -63,9 +67,7 @@ def embed(text: str) -> list[float]:
 
 
 def cosine(a: list[float], b: list[float]) -> float:
-    dot = 0.0
-    na = 0.0
-    nb = 0.0
+    dot = na = nb = 0.0
     for x, y in zip(a, b):
         dot += x * y
         na += x * x
@@ -149,6 +151,77 @@ def generate(question: str, hits: list[dict]) -> str:
     return (data.get("response") or "").strip()
 
 
+def add_file_text(path: str, text: str) -> tuple[int, str | None]:
+    """Embed chunks from one file. Returns (added, error)."""
+    added = 0
+    if len(text.encode("utf-8", "ignore")) > MAX_FILE_BYTES:
+        return 0, None
+    for ch in chunk_text(text):
+        with INDEX_LOCK:
+            if len(INDEX) >= MAX_CHUNKS:
+                return added, "full"
+        try:
+            vec = embed(ch)
+        except Exception as e:
+            return added, f"embed failed ({EMBED_MODEL}): {e}"
+        with INDEX_LOCK:
+            if len(INDEX) >= MAX_CHUNKS:
+                return added, "full"
+            INDEX.append({"path": path, "text": ch, "vec": vec})
+            added += 1
+    return added, None
+
+
+def index_payload(files: list) -> dict:
+    added = 0
+    skipped = 0
+    n = 0
+    for f in files:
+        if n >= MAX_FILES:
+            skipped += 1
+            continue
+        p = str(f.get("path") or "file")
+        ext = Path(p).suffix.lower()
+        if ext and ext not in TEXT_EXT:
+            skipped += 1
+            continue
+        n += 1
+        a, err = add_file_text(p, str(f.get("text") or ""))
+        added += a
+        if err == "full":
+            return {"ok": True, "chunks": len(INDEX), "added": added, "skipped": skipped, "full": True}
+        if err:
+            return {"error": err, "chunks": len(INDEX), "added": added}
+    return {"ok": True, "chunks": len(INDEX), "added": added, "skipped": skipped}
+
+
+def walk_local(root: Path) -> tuple[list[tuple[str, str]], int]:
+    pairs: list[tuple[str, str]] = []
+    skipped = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        for name in filenames:
+            if name.startswith("."):
+                continue
+            fp = Path(dirpath) / name
+            if fp.suffix.lower() not in TEXT_EXT:
+                skipped += 1
+                continue
+            try:
+                if fp.stat().st_size > MAX_FILE_BYTES:
+                    skipped += 1
+                    continue
+                text = fp.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                skipped += 1
+                continue
+            rel = str(fp)
+            pairs.append((rel, text))
+            if len(pairs) >= MAX_FILES:
+                return pairs, skipped
+    return pairs, skipped
+
+
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -193,6 +266,10 @@ HTML = r"""<!DOCTYPE html>
   }
   label.pick:hover { background: #252017; }
   input[type=file] { display: none; }
+  input.path {
+    width: 100%; margin-top: 0.6rem; background: var(--surface); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 8px; padding: 0.5rem 0.65rem; font: inherit;
+  }
   .hint { color: var(--muted); font-size: 0.78rem; line-height: 1.45; margin: 0.75rem 0 1rem; }
   .meta { font-size: 0.78rem; color: var(--muted); }
   button {
@@ -207,21 +284,16 @@ HTML = r"""<!DOCTYPE html>
     color: var(--ink); border: 1px solid var(--line); border-radius: 10px;
     padding: 0.8rem 0.9rem; font: inherit; line-height: 1.5;
   }
-  textarea:focus { outline: 2px solid var(--gold-dim); }
+  textarea:focus, input.path:focus { outline: 2px solid var(--gold-dim); }
   .answer {
     margin-top: 1.1rem; background: var(--surface); border: 1px solid var(--line);
     border-radius: 12px; padding: 1.1rem 1.2rem;
   }
   .answer h2 { font-family: "Source Serif 4", Georgia, serif; font-size: 1.05rem; margin: 0 0 0.7rem; }
-  .answer p, .answer li { line-height: 1.55; font-size: 0.95rem; }
   .cites { margin-top: 1rem; }
-  .cite {
-    border-top: 1px solid var(--line); padding: 0.7rem 0; font-size: 0.8rem;
-  }
+  .cite { border-top: 1px solid var(--line); padding: 0.7rem 0; font-size: 0.8rem; }
   .cite b { color: var(--gold); font-weight: 600; }
-  .cite pre {
-    white-space: pre-wrap; font-family: inherit; color: var(--muted); margin: 0.35rem 0 0;
-  }
+  .cite pre { white-space: pre-wrap; font-family: inherit; color: var(--muted); margin: 0.35rem 0 0; }
   .err { color: var(--danger); font-size: 0.85rem; }
   .bar { height: 4px; background: var(--line); border-radius: 4px; overflow: hidden; margin-top: 0.6rem; }
   .bar > i { display: block; height: 100%; width: 0; background: var(--gold); }
@@ -237,9 +309,14 @@ HTML = r"""<!DOCTYPE html>
     <label class="pick">Add folder
       <input id="dir" type="file" webkitdirectory multiple />
     </label>
-    <p class="hint">Safari and Chrome both support folder pick. Text files only (.md, .txt, source, html). Indexed in RAM for this session.</p>
+    <input class="path" id="disk" placeholder="/Users/you/Documents/notes"/>
+    <div class="row">
+      <button class="ghost" id="fromdisk" type="button">Index this path</button>
+    </div>
+    <p class="hint">Folder pick sends files in small batches. For a huge library, paste the folder path and index from disk (no upload cap).</p>
     <p class="meta" id="lib">Library: empty</p>
     <div class="bar" hidden id="barwrap"><i id="bar"></i></div>
+    <p class="meta" id="prog"></p>
     <div class="row">
       <button class="ghost" id="clear" type="button">Clear library</button>
     </div>
@@ -261,29 +338,28 @@ HTML = r"""<!DOCTYPE html>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
-let files = [];
+const BATCH = 6;
 
 async function status() {
   try {
     const s = await fetch("/api/status").then(r => r.json());
-    const d = $("dot");
     if (!s.ok) {
-      d.className = "dot";
-      $("status").innerHTML = `<span class="dot"></span>Ollama not reachable at ${s.error || "localhost:11434"}`;
+      $("status").innerHTML = `<span class="dot"></span>Ollama not reachable`;
       $("ask").disabled = true;
-      return;
+      return s;
     }
     const miss = [];
     if (!s.has_embed) miss.push(s.embed);
     if (!s.has_gen) miss.push(s.gen);
-    d.className = miss.length ? "dot" : "dot on";
     $("status").innerHTML = miss.length
       ? `<span class="dot"></span>pull missing: ${miss.join(", ")}`
       : `<span class="dot on"></span><strong>${s.gen}</strong> · ${s.embed} · ${s.chunks} chunks`;
     $("ask").disabled = miss.length > 0 || s.chunks === 0;
     $("lib").textContent = `Library: ${s.chunks} chunks`;
+    return s;
   } catch (e) {
     $("status").textContent = "UI server error";
+    return null;
   }
 }
 
@@ -296,45 +372,83 @@ function readFile(file) {
   });
 }
 
+async function postIndex(files) {
+  const r = await fetch("/api/index", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ files }),
+  });
+  const j = await r.json();
+  if (!r.ok || j.error) throw new Error(j.error || r.statusText);
+  return j;
+}
+
 $("dir").addEventListener("change", async (ev) => {
   $("sideerr").textContent = "";
-  const list = [...ev.target.files];
-  const payload = [];
-  for (const f of list) {
+  const list = [...ev.target.files].filter((f) => {
     const name = (f.webkitRelativePath || f.name).toLowerCase();
-    if (/\.(png|jpe?g|gif|webp|pdf|zip|docx|pptx|xlsx|mp[34]|mov|dmg|exe|bin)$/.test(name)) continue;
-    if (f.size > 1500000) continue;
-    try {
-      payload.push({ path: f.webkitRelativePath || f.name, text: await readFile(f) });
-    } catch (_) {}
-  }
-  if (!payload.length) {
+    if (/\.(png|jpe?g|gif|webp|pdf|zip|docx|pptx|xlsx|mp[34]|mov|dmg|exe|bin)$/.test(name)) return false;
+    if (f.size > 1500000) return false;
+    return true;
+  });
+  if (!list.length) {
     $("sideerr").textContent = "No readable text files in that folder.";
+    ev.target.value = "";
     return;
   }
   $("barwrap").hidden = false;
-  $("bar").style.width = "8%";
   try {
-    const r = await fetch("/api/index", {
+    for (let i = 0; i < list.length; i += BATCH) {
+      const slice = list.slice(i, i + BATCH);
+      const payload = [];
+      for (const f of slice) {
+        try {
+          payload.push({ path: f.webkitRelativePath || f.name, text: await readFile(f) });
+        } catch (_) {}
+      }
+      if (payload.length) await postIndex(payload);
+      const pct = Math.round(((i + slice.length) / list.length) * 100);
+      $("bar").style.width = pct + "%";
+      $("prog").textContent = `Indexing ${Math.min(i + slice.length, list.length)} / ${list.length} files`;
+      await status();
+    }
+    $("prog").textContent = "Done.";
+  } catch (e) {
+    $("sideerr").textContent = e.message || String(e);
+  }
+  setTimeout(() => { $("barwrap").hidden = true; $("bar").style.width = "0"; }, 800);
+  ev.target.value = "";
+});
+
+$("fromdisk").onclick = async () => {
+  const p = $("disk").value.trim();
+  $("sideerr").textContent = "";
+  if (!p) { $("sideerr").textContent = "Paste a folder path first."; return; }
+  $("barwrap").hidden = false;
+  $("bar").style.width = "30%";
+  $("prog").textContent = "Reading disk… this can take a while";
+  try {
+    const r = await fetch("/api/index-path", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ files: payload }),
+      body: JSON.stringify({ path: p }),
     });
     const j = await r.json();
-    if (!r.ok) throw new Error(j.error || r.statusText);
+    if (!r.ok || j.error) throw new Error(j.error || r.statusText);
     $("bar").style.width = "100%";
+    $("prog").textContent = `Added ${j.added} chunks` + (j.full ? " (hit chunk cap)" : "");
     await status();
   } catch (e) {
     $("sideerr").textContent = e.message || String(e);
   }
-  setTimeout(() => { $("barwrap").hidden = true; $("bar").style.width = "0"; }, 600);
-  ev.target.value = "";
-});
+  setTimeout(() => { $("barwrap").hidden = true; $("bar").style.width = "0"; }, 800);
+};
 
 $("clear").onclick = async () => {
   await fetch("/api/clear", { method: "POST" });
   await status();
   $("out").hidden = true;
+  $("prog").textContent = "";
 };
 
 $("reload").onclick = status;
@@ -392,7 +506,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _read_json(self) -> dict:
         n = int(self.headers.get("Content-Length") or 0)
-        if n > 40_000_000:
+        if n > MAX_BODY:
             raise ValueError("payload too large")
         return json.loads(self.rfile.read(n).decode("utf-8") or "{}")
 
@@ -421,34 +535,31 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/index":
                 body = self._read_json()
-                files = body.get("files") or []
+                result = index_payload(body.get("files") or [])
+                code = 200 if result.get("ok") else 502
+                self._json(code, result)
+                return
+            if path == "/api/index-path":
+                body = self._read_json()
+                raw_path = str(body.get("path") or "").strip()
+                if not raw_path:
+                    self._json(400, {"error": "empty path"})
+                    return
+                root = Path(raw_path).expanduser()
+                if not root.is_dir():
+                    self._json(400, {"error": f"not a folder: {root}"})
+                    return
+                pairs, skipped = walk_local(root)
                 added = 0
-                skipped = 0
-                with INDEX_LOCK:
-                    if len(INDEX) >= MAX_CHUNKS:
-                        self._json(400, {"error": "library full — clear it first"})
+                for rel, text in pairs:
+                    a, err = add_file_text(rel, text)
+                    added += a
+                    if err == "full":
+                        self._json(200, {"ok": True, "chunks": len(INDEX), "added": added, "skipped": skipped, "full": True})
                         return
-                for f in files[:MAX_FILES]:
-                    p = str(f.get("path") or "file")
-                    ext = Path(p).suffix.lower()
-                    if ext and ext not in TEXT_EXT:
-                        skipped += 1
-                        continue
-                    text = str(f.get("text") or "")
-                    if len(text.encode("utf-8", "ignore")) > MAX_FILE_BYTES:
-                        skipped += 1
-                        continue
-                    for ch in chunk_text(text):
-                        try:
-                            vec = embed(ch)
-                        except Exception as e:
-                            self._json(502, {"error": f"embed failed ({EMBED_MODEL}): {e}"})
-                            return
-                        with INDEX_LOCK:
-                            if len(INDEX) >= MAX_CHUNKS:
-                                break
-                            INDEX.append({"path": p, "text": ch, "vec": vec})
-                            added += 1
+                    if err:
+                        self._json(502, {"error": err, "added": added})
+                        return
                 self._json(200, {"ok": True, "chunks": len(INDEX), "added": added, "skipped": skipped})
                 return
             if path == "/api/ask":
@@ -467,9 +578,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     self._json(502, {"error": f"embed failed: {e}"})
                     return
-                scored = sorted(
-                    snapshot, key=lambda h: cosine(qv, h["vec"]), reverse=True
-                )[:TOP_K]
+                scored = sorted(snapshot, key=lambda h: cosine(qv, h["vec"]), reverse=True)[:TOP_K]
                 hits = [{"path": h["path"], "text": h["text"], "score": cosine(qv, h["vec"])} for h in scored]
                 try:
                     answer = generate(q, hits)

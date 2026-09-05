@@ -41,7 +41,9 @@ ollama stop phi4-mini
 
 Index lives in RAM for the session. Clearing the library or quitting the process drops it. No cloud.
 
-Skipped: images, PDF, Office, archives. Convert those to `.md` / `.txt` first.
+Folder pick used to POST the entire library in one request and died with **payload too large**. Files now go in batches of 6. For a large library, paste the path (e.g. `/Users/you/Documents/notes`) and click **Index this path** — Python reads the disk directly, so nothing is uploaded.
+
+Caps: 2500 files, 4000 chunks, 1.5MB per file. Hidden dirs / `node_modules` / `.git` are skipped.
 
 ## Limits (8GB-safe)
 
